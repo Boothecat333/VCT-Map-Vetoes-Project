@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+data/raw/*.duckdb
+data/processed/*.csv
+data/*.db
+.streamlit/
+.pytest_cache/

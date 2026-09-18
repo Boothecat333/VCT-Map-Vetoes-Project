@@ -1,0 +1,674 @@
+Yes. I think we now have a pretty clear Version 1 methodology, and I agree that we should move to the data pipeline now.
+
+One clarification from your latest message is important:
+
+We only collect 2026 VCT data.
+We don't scrape 2025 and then throw it away. We simply define the dataset as the 2026 season, with older 2026 matches receiving exponentially less weight than newer ones.
+
+That makes sense given the roster-reset problem.
+
+1. Our data source
+
+VLR is a good source for this project because its match pages contain essentially the information we need: teams, event, maps, scores, winners, and map veto information.
+
+There are several unofficial VLR APIs, but I don't want to make our project dependent on a public API that could disappear or hit a rate limit. For example, one currently documented API exposes match results and detailed match endpoints, while another project specifically warns that its previously hosted free API is down because it exceeded its free-tier limits.
+
+So I think the best architecture is:
+
+                    VLR.gg
+                       ↓
+                Our data collector
+                       ↓
+                 raw VCT data
+                       ↓
+              cleaning / validation
+                       ↓
+              processed match data
+                       ↓
+               Power Score model
+                       ↓
+                 Streamlit app
+
+That means we own the dataset rather than making the website depend on somebody else's API.
+
+2. What we're going to collect
+
+For every VCT 2026 map, I want a row roughly like:
+
+Column	Example
+date	2026-08-15
+event	VCT 2026: Americas Stage 2
+region	Americas
+match_id	123456
+team	G2 Esports
+opponent	Sentinels
+map	Ascent
+rounds_for	13
+rounds_against	9
+result	W
+
+Notice that I'm intentionally not making the dataset player-stat heavy.
+
+We don't need:
+
+kills
+ACS
+K/D
+agent picks
+headshots
+etc.
+
+Those could be interesting later, but they're irrelevant to the first version of your model.
+
+3. One important thing: BO3/BO5 matches
+
+A VCT series might be:
+
+G2 2–1 SEN
+
+Ascent 13–8
+Bind   10–13
+Haven  13–7
+
+Our dataset should become three separate observations:
+
+G2 vs SEN | Ascent | 13–8 | W
+G2 vs SEN | Bind   | 10–13 | L
+G2 vs SEN | Haven  | 13–7 | W
+
+That's exactly what we need because we're evaluating map strength, not series strength.
+
+4. And we should store the veto information separately
+
+I agree with your reasoning about not necessarily using it.
+
+We'll collect it if it's easy, but we won't make the model depend on it.
+
+Something like:
+
+match_id
+team
+action
+map
+
+could eventually tell us:
+
+SEN → ban → Breeze
+G2  → ban → Lotus
+SEN → pick → Ascent
+G2  → pick → Bind
+
+But that's historical behaviour, not necessarily optimal behaviour.
+
+A permanent ban is a great example.
+
+If a team bans Breeze every single time, that doesn't mean:
+
+"Breeze is the map the model thinks they should ban."
+
+It might mean:
+
+"They simply don't play Breeze."
+
+So actual vetoes are useful for analysis/validation, but I don't want them influencing the Power Score.
+
+That's an important distinction.
+
+5. The Power Score methodology we're aiming for
+
+Before we write the formula, I'd structure the data so that we can calculate this:
+
+Team A on Ascent
+
+For every Ascent match:
+
+opponent
+result
+round differential
+match date
+
+Then:
+
+Step 1 — Determine opponent strength
+
+For each opponent, calculate their own Ascent performance, using their 2026 Ascent matches.
+
+Step 2 — Determine Team A's performance
+
+Team A gets more credit for:
+
+beating strong Ascent teams
+beating them convincingly
+
+And gets penalized for:
+
+losing to weak Ascent teams
+losing badly
+Step 3 — Apply recency
+
+A February match contributes less than an August match.
+
+Step 4 — Combine it
+
+That produces:
+
+Team A Ascent Power Score
+
+And then repeat for every map.
+
+6. I want to avoid inventing the 0–100 scale too early
+
+This is something I want to be careful about.
+
+We can first create a raw Power Rating.
+
+For example:
+
+G2 Ascent     1.83
+SEN Ascent    1.42
+FNATIC Ascent 1.91
+
+Those numbers don't need to mean anything by themselves.
+
+Then once we've calculated ratings for all teams/maps, we can transform them into something user-friendly:
+
+0–100 Power Score
+
+That way we're not arbitrarily saying:
+
+"70 = good because 70 sounds good."
+
+Instead, the 0–100 score is just a visualization of the underlying model.
+
+7. What I want to do first
+
+I don't think we should write the Power Score yet.
+
+Our first milestone should literally be:
+
+Get VCT 2026 map data from VLR into a pandas DataFrame.
+
+Then we'll inspect it.
+
+The process will be:
+
+Step 1
+
+Set up the project.
+
+vct-map-analytics/
+│
+├── app.py
+│
+├── data/
+│   ├── raw/
+│   └── processed/
+│
+├── src/
+│   ├── collect.py
+│   ├── clean.py
+│   └── power_score.py
+│
+├── requirements.txt
+└── README.md
+Step 2
+
+Create a Python VLR collector.
+
+Step 3
+
+Find the relevant 2026 VCT events.
+
+Step 4
+
+Get the matches from those events.
+
+Step 5
+
+For every completed match, retrieve its map details.
+
+Step 6
+
+Turn each map into a clean row.
+
+Step 7
+
+Save it locally:
+
+data/raw/vct_2026_maps.csv
+Step 8
+
+Inspect the dataset together.
+
+Only after we see the actual data will we finalize the Power Score formula.
+
+One thing I want to avoid
+
+I don't want you to spend hours manually downloading CSVs or copying VLR information.
+
+The whole point of this project is for Python to do the data gathering.
+
+So your job at this stage is basically:
+
+Create the project folder.
+Install Python if needed.
+I'll give you the exact files/code.
+Run it.
+We inspect what it produced.
+Fix anything weird.
+Then move to the model.
+
+And because you're beginner/intermediate with Python, I'll explain what each part is doing rather than dumping a 500-line scraper on you.
+
+So our immediate next step is the VLR data collector.
+
+I would start by building a small Python script that can retrieve one VLR match, parse its maps, and print the resulting rows. Once that works, we scale it up to all 2026 VCT matches. That is much safer than immediately trying to scrape the entire season.
+
+we arent focusing on it now but the model we have will start with bo3 (for the be the gm mode and stuff etc) because bo5 often has one team doing double map bans we can add that at the end
+
+Yep — that should be the plan.
+
+V1: BO3 only
+
+We'll design the Be the GM and Veto Simulator around a standard BO3 veto:
+
+Team A bans
+Team B bans
+Team A picks
+Team B picks
+Remaining map = decider
+
+So with 7 maps:
+
+7 maps
+ ↓
+Team A ban → 6
+ ↓
+Team B ban → 5
+ ↓
+Team A pick → 4
+ ↓
+Team B pick → 3
+ ↓
+decider + the 2 picked maps
+
+Actually, for the match data, we'll still collect all maps played in VCT 2026, regardless of whether the series was BO3 or BO5. The veto simulator itself will initially only support BO3.
+
+That separation is important:
+
+                    VCT DATA
+                       │
+              ┌────────┴────────┐
+              ↓                 ↓
+        Map Power Model     Match metadata
+              │
+              ↓
+       BO3 Veto Simulator
+              │
+              ↓
+        Be The GM
+
+Then later, when we're happy with everything:
+
+V2: BO5
+
+We can add the different veto structure, including the double bans, without having to rewrite the Power Score model.
+
+And I agree that BO5 should be an add-on rather than something we try to solve immediately. The Power Score doesn't care whether a map came from a BO3 or BO5; it's the veto logic that changes.
+
+So we're locked in on:
+
+Data: VCT 2026 map results
+Model: opponent-adjusted + round margin + exponential recency decay
+Veto: BO3 first
+BO5: later
+Historical veto behaviour: collected if convenient, but NOT used to determine the model
+
+Now we can actually start building the thing.
+
+Yeah — Python can technically do almost everything SQL would do here, so SQL is not necessary for this project.
+
+But for a data-analytics portfolio project, SQL can be a genuinely useful bridge rather than an unnecessary extra step.
+
+Think of it like this:
+
+Without SQL
+
+You could do:
+
+VLR data
+   ↓
+Python / pandas
+   ↓
+filter + calculate + aggregate
+   ↓
+Power Score
+   ↓
+Streamlit
+
+For example, Python could load all the match data and say:
+
+“Give me G2's Ascent matches from 2026.”
+
+Then pandas does the filtering.
+
+With SQL
+
+You instead have:
+
+VLR data
+   ↓
+SQLite database
+   ↓
+SQL → "Give me G2's Ascent matches"
+   ↓
+Python → calculate Power Score
+   ↓
+Streamlit
+
+So yes, there is an extra layer.
+
+But the important distinction is that SQL and Python are good at different parts of the job.
+
+Task	SQL	Python
+Store lots of structured data	✅	⚠️
+Filter data	✅	✅
+Group/aggregate data	✅	✅
+Join different datasets	✅	✅
+Statistical calculations	⚠️	✅
+Exponential decay	😐	✅
+Build Power Score	😐	✅
+Build website	❌	✅
+Machine learning later	❌	✅
+Why I'd actually use SQL for your project
+
+The biggest reason isn't that SQL makes the VCT project easier.
+
+It's that you're trying to become a data analyst.
+
+SQL is one of those things where having a project that genuinely uses it is much more valuable than saying:
+
+"I know some SQL."
+
+Your VCT project gives you a very natural reason to learn it.
+
+For example, later you could have:
+
+SELECT
+    team,
+    map,
+    COUNT(*) AS maps_played,
+    AVG(rounds_for - rounds_against) AS avg_round_margin
+FROM map_results
+WHERE season = 2026
+GROUP BY team, map;
+
+That query basically says:
+
+"For every team and map, tell me how many times they played it and their average round margin."
+
+Then Python takes that result and does the more complicated Power Score calculation.
+
+That's actually a pretty realistic analytics workflow.
+
+And there's another advantage: the data gets bigger
+
+Imagine we eventually have:
+
+10,000 map records
+
+You don't necessarily want Python loading everything and then doing:
+
+df[df["team"] == "G2"]
+
+every time someone clicks something on your website.
+
+Instead, your application can ask the database:
+
+"Give me only the records I need."
+
+SQL is essentially the query layer between your application and your data.
+
+That's why I'd structure yours as:
+
+              VCT DATA
+                 ↓
+          ┌─────────────┐
+          │   SQLite    │  ← stores everything
+          └──────┬──────┘
+                 │
+                SQL
+                 ↓
+       "Give me G2's Ascent data"
+                 ↓
+             Python
+                 ↓
+      Power Score calculation
+                 ↓
+            Streamlit
+                 ↓
+              Website
+But I don't want to overengineer this
+
+This is important.
+
+We should not use SQL just because "SQL looks good on a resume."
+
+If we're adding 15 database tables, complicated queries, an ORM, etc. just to say we used SQL, then yeah — that's unnecessary.
+
+I'd keep it simple:
+
+SQLite + basic SQL + Python/pandas.
+
+And you'll learn SQL naturally while building the project.
+
+So I'd say SQL is a useful bridge here, not a requirement. It gives us a clean separation:
+
+SQL gets the data → Python analyzes the data → Streamlit presents the data.
+
+And that's a very legitimate data-analyst workflow.
+
+ok so me and you are the brain. sql is my assistant to get files from the cabinet. I then give these files to my coding assistant copilot (unless you can also do that).
+
+my friend says use VScode
+
+Yeah 😂 that's actually a pretty good analogy.
+
+Think of the project like this:
+
+                 YOU + ME
+                  🧠
+            Decide what to build
+            Decide methodology
+            Decide what data means
+                    │
+                    ▼
+               SQL + SQLite
+              🗄️ "File cabinet"
+                    │
+          "Give me G2's Ascent
+             matches in 2026"
+                    │
+                    ▼
+                Python
+             🛠️ "Do stuff
+              with the data"
+                    │
+                    ▼
+               Streamlit
+              🖥️ "Show it
+               on a website"
+
+And then Copilot is your coding assistant:
+
+You + Me → "We need a function that calculates opponent-adjusted
+            map strength."
+
+Copilot → helps write/debug the Python code.
+And yes, I'd use VS Code
+
+Your friend is right. VS Code is a very good choice for this project.
+
+You'd have something like:
+
+VCT-Map-Analytics/
+│
+├── app.py
+├── data/
+│   └── vct.db
+│
+├── src/
+│   ├── data_loader.py
+│   ├── power_score.py
+│   └── veto.py
+│
+├── sql/
+│   └── queries.sql
+│
+├── requirements.txt
+└── README.md
+
+VS Code becomes your workbench where all of this lives.
+
+One correction to your analogy
+
+You don't actually need to manually "give files to Copilot."
+
+Copilot can see the code/files in your VS Code project, so it can help you write things like:
+
+"Create a function that queries the SQLite database for all 2026 Ascent matches involving G2."
+
+But you and I should decide what that function is supposed to accomplish and what the methodology is.
+
+That's the distinction I'd maintain:
+
+Me:
+🧠 Architecture, methodology, statistics, SQL explanations, debugging with you, deciding what we're actually building.
+
+Copilot:
+⌨️ Helps write the code faster, autocomplete, boilerplate, small implementation details, debugging suggestions.
+
+You:
+👨‍💻 Actually learning how the pieces work and putting the project together with us.
+
+So I wouldn't have Copilot independently designing the Power Score. That's the part where you want to understand why the project works.
+
+Our eventual workflow
+
+We'll basically go:
+
+1. Get VCT data
+
+→ figure out a legitimate/reliable source
+→ get 2026 map-level results
+
+2. Put it in SQLite
+
+→ learn basic SQL while doing it
+
+3. Query it
+
+→ SQL retrieves the relevant matches
+
+4. Build Power Score
+
+→ Python
+→ round differential
+→ opponent strength
+→ exponential recency weighting
+→ two-degree adjustment
+
+5. Build the veto logic
+
+→ Python uses the Power Scores
+→ generates each team's map picklist
+→ simulates BO3 veto
+
+6. Build the Streamlit website
+
+→ make it look good
+→ graphs/visualizations
+→ Team A vs Team B
+→ map analysis
+→ "Be the GM"
+→ veto simulator
+
+7. Put it on GitHub + deploy it
+
+And importantly, we don't need to build all of that at once.
+
+The next thing I'd focus on is getting one real VCT 2026 event into our hands. Once we prove we can reliably get the actual map data, then we build the database around it.
+
+I have found a csv on kaggle that has all the 2026 matches so far (london, santiago, kickoff, and stage 1) except for stage 2. i cant find one with stage 2 unless theres something im missing. I am just looking at the update dates but i guess if theres a tool to download that still works for modern matches to scrape then idk if it will work or not.
+
+Yeah — I think you’re missing a much easier option than trying to make our own VLR scraper.
+
+I checked the current 2026 data situation, and there is now a dataset specifically built around VCT data that is updated daily.
+
+The interesting part
+
+VCT Reference has a downloadable DuckDB database containing tier-1 VCT matches, including the 2026 Stage 2 events. It says the database was last updated September 18, 2026 and includes series and map-level data.
+
+And we can verify that Stage 2 data is actually there — for example, VLR currently has the completed 2026 Americas Stage 2 matches and their individual map scores.
+
+So rather than:
+
+Kaggle CSV
+   +
+some weird scraper/API
+   +
+Stage 2
+   ↓
+merge everything ourselves
+
+we may be able to do:
+
+VCT Reference dataset
+        ↓
+     DuckDB
+        ↓
+      SQL
+        ↓
+   Python/Pandas
+        ↓
+   Power Score
+And this actually fits our SQL plan REALLY well
+
+Remember your analogy:
+
+SQL = assistant getting files from the filing cabinet.
+
+DuckDB is basically another type of database/file cabinet.
+
+We could query it directly with SQL:
+
+SELECT *
+FROM maps
+WHERE year = 2026;
+
+and then Python takes the results and does the actual statistical work.
+
+Even better: the dataset says it is rebuilt daily, so we don't have to worry about finding a stale Kaggle CSV every time a new tournament finishes.
+
+One thing I want to check before we commit
+
+The dataset has a lot more information than we actually need — player stats, rounds, etc.
+
+That's not necessarily bad. We just need to figure out its exact table structure and make sure it gives us the specific fields we need:
+
+date
+event
+region
+match
+team
+opponent
+map
+rounds for
+rounds against
+result
+
+If it does, I'd much rather use this than write a VLR scraper ourselves.
+
+And your Kaggle CSV isn't useless either. We can potentially use it as a cross-check against the new dataset for the matches you already have.
+
+So I think our next step should be inspect the VCT Reference database and see exactly what tables/columns it gives us, rather than immediately downloading/building anything.
