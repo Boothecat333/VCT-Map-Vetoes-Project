@@ -19,6 +19,7 @@ RAW_DATA_DIR = PROJECT_ROOT / "data" / "raw"
 PROCESSED_DATA_DIR = PROJECT_ROOT / "data" / "processed"
 DEFAULT_DUCKDB_PATH = RAW_DATA_DIR / "vct.duckdb"
 DEFAULT_CSV_PATH = PROCESSED_DATA_DIR / "vct_2026_maps.csv"
+DEFAULT_VETO_CSV_PATH = PROCESSED_DATA_DIR / "vct_2026_vetoes.csv"
 DEFAULT_SQLITE_PATH = PROJECT_ROOT / "data" / "vct_analytics.db"
 
 
@@ -203,17 +204,205 @@ def save_to_sqlite(df: pd.DataFrame, sqlite_path: Optional[Path] = None, schema_
     print(f"[Pipeline] Loaded {len(records)} rows into SQLite database at {dest}")
 
 
+def extract_2026_vetoes(duckdb_path: Optional[Path] = None) -> pd.DataFrame:
+    """
+    Connects to vct.duckdb and extracts all completed 2026 pick/ban veto records.
+    Resolves team tags to canonical team names using picked_by_team mappings.
+    """
+    db_file = duckdb_path or DEFAULT_DUCKDB_PATH
+    if not db_file.exists():
+        raise FileNotFoundError(f"DuckDB database not found at {db_file}. Run download_duckdb() first.")
+
+    con = duckdb.connect(str(db_file), read_only=True)
+
+    query = """
+    SELECT 
+        m.match_id,
+        CAST(m.utc_timestamp AS DATE) AS match_date,
+        m.event AS event_name,
+        COALESCE(m.series_stage, '') AS stage_name,
+        COALESCE(m.region, 'International') AS region,
+        t0.team_name AS team0,
+        t1.team_name AS team1,
+        m.veto,
+        mp.map_name,
+        mp.picked_by_team
+    FROM matches m
+    JOIN teams t0 ON m.team0_id = t0.team_id
+    JOIN teams t1 ON m.team1_id = t1.team_id
+    JOIN maps mp ON m.match_id = mp.match_id
+    WHERE EXTRACT(year FROM m.utc_timestamp) = 2026
+      AND m.veto IS NOT NULL
+      AND mp.picked_by_team IS NOT NULL
+    ORDER BY m.utc_timestamp ASC, m.match_id, mp.game_id;
+    """
+
+    try:
+        rows = con.execute(query).fetchall()
+    finally:
+        con.close()
+
+    matches = {}
+    for mid, dt, evt, stg, reg, t0, t1, veto, map_name, picked_by in rows:
+        if mid not in matches:
+            matches[mid] = {
+                "date": str(dt),
+                "event": str(evt).strip(),
+                "stage": str(stg).strip(),
+                "region": str(reg).strip(),
+                "team0": str(t0).strip(),
+                "team1": str(t1).strip(),
+                "veto": veto,
+                "picks": {}
+            }
+        matches[mid]["picks"][str(map_name).strip().capitalize()] = picked_by
+
+    parsed_records = []
+    for mid, mdata in matches.items():
+        t0 = mdata["team0"]
+        t1 = mdata["team1"]
+        tag_to_team = {}
+        for item in mdata["veto"]:
+            parts = item.split()
+            if len(parts) >= 3 and parts[1].lower() == "pick":
+                tag = parts[0]
+                map_picked = " ".join(parts[2:]).strip().capitalize()
+                if map_picked in mdata["picks"]:
+                    picked_by = mdata["picks"][map_picked]
+                    tag_to_team[tag] = t0 if picked_by == 0 else t1
+
+        if len(tag_to_team) < 2:
+            continue
+
+        ban_count = 0
+        phase_order = 1
+        for item in mdata["veto"]:
+            item_str = item.strip()
+            if " ban " in item_str:
+                tag, map_name = item_str.split(" ban ", 1)
+                tag = tag.strip()
+                map_name = map_name.strip().capitalize()
+                if tag in tag_to_team:
+                    acting_team = tag_to_team[tag]
+                    opp = t1 if acting_team == t0 else t0
+                    phase = 1 if ban_count < 2 else 3
+                    ban_count += 1
+                    parsed_records.append({
+                        "match_id": str(mid),
+                        "date": mdata["date"],
+                        "event": mdata["event"],
+                        "stage": mdata["stage"],
+                        "region": mdata["region"],
+                        "team": acting_team,
+                        "opponent": opp,
+                        "action": "BAN",
+                        "phase": phase,
+                        "phase_order": phase_order,
+                        "map": map_name,
+                    })
+                    phase_order += 1
+            elif " pick " in item_str:
+                tag, map_name = item_str.split(" pick ", 1)
+                tag = tag.strip()
+                map_name = map_name.strip().capitalize()
+                if tag in tag_to_team:
+                    acting_team = tag_to_team[tag]
+                    opp = t1 if acting_team == t0 else t0
+                    parsed_records.append({
+                        "match_id": str(mid),
+                        "date": mdata["date"],
+                        "event": mdata["event"],
+                        "stage": mdata["stage"],
+                        "region": mdata["region"],
+                        "team": acting_team,
+                        "opponent": opp,
+                        "action": "PICK",
+                        "phase": 2,
+                        "phase_order": phase_order,
+                        "map": map_name,
+                    })
+                    phase_order += 1
+            elif " remains" in item_str:
+                map_name = item_str.replace(" remains", "").strip().capitalize()
+                parsed_records.append({
+                    "match_id": str(mid),
+                    "date": mdata["date"],
+                    "event": mdata["event"],
+                    "stage": mdata["stage"],
+                    "region": mdata["region"],
+                    "team": "Decider",
+                    "opponent": "Decider",
+                    "action": "DECIDER",
+                    "phase": 4,
+                    "phase_order": phase_order,
+                    "map": map_name,
+                })
+                phase_order += 1
+
+    vetoes_df = pd.DataFrame(parsed_records)
+    print(f"[Pipeline] Parsed {len(vetoes_df)} veto actions across {len(matches)} matches.")
+    return vetoes_df
+
+
+def save_vetoes_to_csv(df: pd.DataFrame, csv_path: Optional[Path] = None):
+    """Saves parsed veto DataFrame to CSV."""
+    dest = csv_path or DEFAULT_VETO_CSV_PATH
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(dest, index=False, encoding="utf-8")
+    print(f"[Pipeline] Saved vetoes CSV to {dest}")
+
+
+def save_vetoes_to_sqlite(df: pd.DataFrame, sqlite_path: Optional[Path] = None, schema_path: Optional[Path] = None):
+    """Loads parsed veto DataFrame into SQLite database."""
+    dest = sqlite_path or DEFAULT_SQLITE_PATH
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    
+    schema_file = schema_path or (PROJECT_ROOT / "sql" / "schema.sql")
+    conn = sqlite3.connect(str(dest))
+    
+    if schema_file.exists():
+        with open(schema_file, "r", encoding="utf-8") as f:
+            conn.executescript(f.read())
+
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM match_vetoes;")
+    insert_sql = """
+    INSERT OR REPLACE INTO match_vetoes (
+        match_id, date, event, stage, region, team, opponent,
+        action, phase, phase_order, map
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+    """
+    records = df[[
+        "match_id", "date", "event", "stage", "region", "team", "opponent",
+        "action", "phase", "phase_order", "map"
+    ]].values.tolist()
+
+    cursor.executemany(insert_sql, records)
+    conn.commit()
+    conn.close()
+    print(f"[Pipeline] Loaded {len(records)} veto rows into SQLite database at {dest}")
+
+
 def run_pipeline(force_download: bool = False):
     """Executes end-to-end data pipeline."""
     ensure_directories()
     duckdb_file = download_duckdb(force=force_download)
-    df = extract_2026_maps(duckdb_file)
-    save_to_csv(df)
-    save_to_sqlite(df)
+    
+    # 1. Map outcomes
+    df_maps = extract_2026_maps(duckdb_file)
+    save_to_csv(df_maps)
+    save_to_sqlite(df_maps)
+
+    # 2. Match vetoes
+    df_vetoes = extract_2026_vetoes(duckdb_file)
+    save_vetoes_to_csv(df_vetoes)
+    save_vetoes_to_sqlite(df_vetoes)
+
     print("[Pipeline] Data pipeline completed successfully!")
-    return df
+    return df_maps, df_vetoes
 
 
 if __name__ == "__main__":
     force = "--force" in sys.argv
     run_pipeline(force_download=force)
+

@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Optional, Dict, Tuple
 from src.power_score import PowerScoreModel, ACTIVE_MAP_POOL
+from src.veto_analysis import VetoTendencyAnalyzer
 
 
 class ActionType(str, Enum):
@@ -67,9 +68,15 @@ class VetoSimulator:
         (7, "NONE", ActionType.DECIDER, "Decider Map"),
     ]
 
-    def __init__(self, model: PowerScoreModel, map_pool: Optional[List[str]] = None):
+    def __init__(
+        self,
+        model: PowerScoreModel,
+        map_pool: Optional[List[str]] = None,
+        analyzer: Optional[VetoTendencyAnalyzer] = None,
+    ):
         self.model = model
         self.map_pool = list(map_pool or ACTIVE_MAP_POOL)
+        self.analyzer = analyzer or VetoTendencyAnalyzer()
 
     def create_session(self, team_a: str, team_b: str) -> VetoState:
         """Initializes a new veto session for Team A vs Team B."""
@@ -99,13 +106,14 @@ class VetoSimulator:
 
     def recommend_action(self, state: VetoState) -> Tuple[str, str]:
         """
-        Recommends optimal map selection for the current actor based on Power Scores.
+        Recommends optimal map selection for the current actor based on Permabans and Power Scores.
         Returns: (recommended_map, rationale_explanation)
         """
         prompt = self.get_current_prompt(state)
         if not prompt or not state.available_maps:
             return ("", "Veto complete")
 
+        step_num = prompt["step_number"]
         actor = prompt["actor"]
         action_type = prompt["action_type"]
 
@@ -134,15 +142,34 @@ class VetoSimulator:
             return (best_map, explanation)
 
         elif action_type == ActionType.BAN:
-            # Ban lowest win probability map (opponents' greatest advantage)
+            # 1. Check for verified permaban in First Cycle (Turns 1 & 2)
+            if step_num in (1, 2) and self.analyzer:
+                prof = self.analyzer.get_profile(actor)
+                if prof and prof.permaban and prof.permaban in state.available_maps:
+                    rate_pct = round((prof.permaban_rate or 0) * 100, 1)
+                    explanation = (
+                        f"🔒 Permaban: {actor} bans {prof.permaban} in {rate_pct}% "
+                        f"of matches ({prof.total_series} series sample). Recommended ban adheres to team philosophy."
+                    )
+                    return (prof.permaban, explanation)
+
+            # 2. Fallback to lowest win probability map (opponents' greatest advantage)
             worst_map = min(map_probs.keys(), key=lambda m: map_probs[m])
             worst_prob = round(map_probs[worst_map] * 100, 1)
             opp = state.team_b if actor == state.team_a else state.team_a
             ps_opp = self.model.get_rating(opp, worst_map).power_score
             ps_actor = self.model.get_rating(actor, worst_map).power_score
+
+            tendency_note = ""
+            if step_num in (1, 2) and self.analyzer:
+                prof = self.analyzer.get_profile(actor)
+                if prof and prof.top_ban and prof.top_ban in state.available_maps:
+                    top_pct = round((prof.top_ban_rate or 0) * 100, 1)
+                    tendency_note = f" (Note: {actor}'s top historical ban is {prof.top_ban} at {top_pct}%)."
+
             explanation = (
                 f"Banning {worst_map} removes {opp}'s strong {ps_opp:.1f} Power Score "
-                f"({actor} is {ps_actor:.1f}). Protects against an estimated {100-worst_prob:.1f}% opponent map edge."
+                f"({actor} is {ps_actor:.1f}). Protects against an estimated {100-worst_prob:.1f}% opponent map edge.{tendency_note}"
             )
             return (worst_map, explanation)
 
